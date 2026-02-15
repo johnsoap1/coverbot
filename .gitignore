@@ -1,3 +1,19 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtualenv
+venv/
+
+# Pyrogram session
+*.session
+*.session-journal
+
+# Logs
+*.log
 .idea/
 *.pyc
 *.gitattributes

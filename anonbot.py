@@ -1,6 +1,9 @@
 import os
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+
+from dotenv import load_dotenv
+load_dotenv()
 from Config import Config
 from collections import defaultdict
 import asyncio
@@ -57,10 +60,18 @@ async def rate_limit_check(chat_id, is_group=False):
     
     return 0
 
+<<<<<<< HEAD
 async def send_with_rate_limit(send_func, target_chat_id, is_group=False, *args, **kwargs):
+=======
+async def send_with_rate_limit(send_func, *args, chat_id=None, is_group=False, **kwargs):
+>>>>>>> e7eb98b (pedro updates)
     """
     Send message with automatic rate limiting
+    chat_id must be passed as keyword argument
     """
+    if chat_id is None:
+        raise ValueError("chat_id must be provided")
+    
     while True:
         wait_time = await rate_limit_check(target_chat_id, is_group)
         if wait_time > 0:
@@ -69,19 +80,20 @@ async def send_with_rate_limit(send_func, target_chat_id, is_group=False, *args,
             break
     
     try:
-        result = await send_func(*args, **kwargs)
-        
-        # Update rate limit tracking
+        # Pass chat_id as kwarg to the actual send function
+        result = await send_func(*args, chat_id=chat_id, **kwargs)
         current_time = time.time()
         last_send_time[target_chat_id] = current_time
         global_send_times.append(current_time)
-        
         return result
-        
     except FloodWait as e:
         print(f"FloodWait: Waiting {e.value} seconds")
         await asyncio.sleep(e.value)
+<<<<<<< HEAD
         return await send_with_rate_limit(send_func, target_chat_id, is_group, *args, **kwargs)
+=======
+        return await send_with_rate_limit(send_func, *args, chat_id=chat_id, is_group=is_group, **kwargs)
+>>>>>>> e7eb98b (pedro updates)
 
 @Bot.on_message(filters.private & filters.command("start"))
 async def start(client, message):
@@ -166,6 +178,7 @@ async def forward_to_storage(client, media_message, user_id):
         return None
     
     try:
+<<<<<<< HEAD
         forwarded = await send_with_rate_limit(
             client.forward_messages,
             Config.STORAGE_GROUP_ID,
@@ -173,6 +186,15 @@ async def forward_to_storage(client, media_message, user_id):
             chat_id=Config.STORAGE_GROUP_ID,
             from_chat_id=media_message.chat.id,
             message_ids=media_message.id
+=======
+        # Fixed: Use chat_id keyword argument
+        forwarded = await send_with_rate_limit(
+            client.forward_messages,
+            chat_id=Config.STORAGE_GROUP_ID,      # Destination chat
+            from_chat_id=media_message.chat.id,   # Source chat  
+            message_ids=media_message.id,
+            is_group=True
+>>>>>>> e7eb98b (pedro updates)
         )
 
         print(f"Forwarded media to storage group for user {user_id}")
@@ -194,31 +216,47 @@ async def send_single_media(client, message, user_id):
         if media.photo:
             sent = await send_with_rate_limit(
                 client.send_photo,
+<<<<<<< HEAD
                 message.chat.id,
+=======
+                chat_id=message.chat.id,
+>>>>>>> e7eb98b (pedro updates)
                 photo=media.photo.file_id,
                 caption="✅ **Anonymous Media Ready**\nForward this to any chat - no attribution!"
             )
         elif media.video:
             sent = await send_with_rate_limit(
                 client.send_video,
+<<<<<<< HEAD
                 message.chat.id,
+=======
+                chat_id=message.chat.id,
+>>>>>>> e7eb98b (pedro updates)
                 video=media.video.file_id,
-                caption="✅ **Anonymous Video Ready**\nForward this to any chat - no attribution!"
+                caption="✅ **Anonymous Video Ready**"
             )
         elif media.document:
             sent = await send_with_rate_limit(
                 client.send_document,
+<<<<<<< HEAD
                 message.chat.id,
+=======
+                chat_id=message.chat.id,
+>>>>>>> e7eb98b (pedro updates)
                 document=media.document.file_id,
-                caption="✅ **Anonymous Document Ready**\nForward this to any chat - no attribution!"
+                caption="✅ **Anonymous Document Ready**"
             )
         elif media.audio:
             sent = await send_with_rate_limit(
                 client.send_audio,
+<<<<<<< HEAD
                 message.chat.id,
+=======
+                chat_id=message.chat.id,
+>>>>>>> e7eb98b (pedro updates)
                 audio=media.audio.file_id,
-                caption="✅ **Anonymous Audio Ready**\nForward this to any chat - no attribution!"
-            )
+                caption="✅ **Anonymous Audio Ready**"
+)
     except Exception as e:
         await message.reply_text(f"❌ Error sending media: {str(e)}")
         media_groups[user_id].clear()
@@ -353,7 +391,11 @@ async def create_album(client, callback_query, user_id):
     try:
         await send_with_rate_limit(
             client.send_media_group,
+<<<<<<< HEAD
             callback_query.message.chat.id,
+=======
+            chat_id=callback_query.message.chat.id,
+>>>>>>> e7eb98b (pedro updates)
             media=media_list
         )
         
