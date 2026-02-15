@@ -10,7 +10,7 @@ from pyrogram.types import (
     InputMediaDocument,
 )
 
-from config import Config
+from Config import Config
 
 # ------------------ Logging ------------------ #
 
