@@ -195,7 +195,6 @@ async def send_single_media(client, message, user_id):
             sent = await send_with_rate_limit(
                 client.send_photo,
                 message.chat.id,
-                chat_id=message.chat.id,
                 photo=media.photo.file_id,
                 caption="✅ **Anonymous Media Ready**\nForward this to any chat - no attribution!"
             )
@@ -203,7 +202,6 @@ async def send_single_media(client, message, user_id):
             sent = await send_with_rate_limit(
                 client.send_video,
                 message.chat.id,
-                chat_id=message.chat.id,
                 video=media.video.file_id,
                 caption="✅ **Anonymous Video Ready**\nForward this to any chat - no attribution!"
             )
@@ -211,7 +209,6 @@ async def send_single_media(client, message, user_id):
             sent = await send_with_rate_limit(
                 client.send_document,
                 message.chat.id,
-                chat_id=message.chat.id,
                 document=media.document.file_id,
                 caption="✅ **Anonymous Document Ready**\nForward this to any chat - no attribution!"
             )
@@ -219,7 +216,6 @@ async def send_single_media(client, message, user_id):
             sent = await send_with_rate_limit(
                 client.send_audio,
                 message.chat.id,
-                chat_id=message.chat.id,
                 audio=media.audio.file_id,
                 caption="✅ **Anonymous Audio Ready**\nForward this to any chat - no attribution!"
             )
@@ -358,7 +354,6 @@ async def create_album(client, callback_query, user_id):
         await send_with_rate_limit(
             client.send_media_group,
             callback_query.message.chat.id,
-            chat_id=callback_query.message.chat.id,
             media=media_list
         )
         
@@ -406,28 +401,24 @@ async def send_individually(client, callback_query, user_id):
                 await send_with_rate_limit(
                     client.send_photo,
                     callback_query.message.chat.id,
-                    chat_id=callback_query.message.chat.id,
                     photo=msg.photo.file_id
                 )
             elif msg.video:
                 await send_with_rate_limit(
                     client.send_video,
                     callback_query.message.chat.id,
-                    chat_id=callback_query.message.chat.id,
                     video=msg.video.file_id
                 )
             elif msg.document:
                 await send_with_rate_limit(
                     client.send_document,
                     callback_query.message.chat.id,
-                    chat_id=callback_query.message.chat.id,
                     document=msg.document.file_id
                 )
             elif msg.audio:
                 await send_with_rate_limit(
                     client.send_audio,
                     callback_query.message.chat.id,
-                    chat_id=callback_query.message.chat.id,
                     audio=msg.audio.file_id
                 )
             
