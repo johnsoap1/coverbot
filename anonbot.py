@@ -57,12 +57,12 @@ async def rate_limit_check(chat_id, is_group=False):
     
     return 0
 
-async def send_with_rate_limit(send_func, chat_id, is_group=False, *args, **kwargs):
+async def send_with_rate_limit(send_func, target_chat_id, is_group=False, *args, **kwargs):
     """
     Send message with automatic rate limiting
     """
     while True:
-        wait_time = await rate_limit_check(chat_id, is_group)
+        wait_time = await rate_limit_check(target_chat_id, is_group)
         if wait_time > 0:
             await asyncio.sleep(wait_time)
         else:
@@ -73,7 +73,7 @@ async def send_with_rate_limit(send_func, chat_id, is_group=False, *args, **kwar
         
         # Update rate limit tracking
         current_time = time.time()
-        last_send_time[chat_id] = current_time
+        last_send_time[target_chat_id] = current_time
         global_send_times.append(current_time)
         
         return result
@@ -81,7 +81,7 @@ async def send_with_rate_limit(send_func, chat_id, is_group=False, *args, **kwar
     except FloodWait as e:
         print(f"FloodWait: Waiting {e.value} seconds")
         await asyncio.sleep(e.value)
-        return await send_with_rate_limit(send_func, chat_id, is_group, *args, **kwargs)
+        return await send_with_rate_limit(send_func, target_chat_id, is_group, *args, **kwargs)
 
 @Bot.on_message(filters.private & filters.command("start"))
 async def start(client, message):
@@ -166,15 +166,15 @@ async def forward_to_storage(client, media_message, user_id):
         return None
     
     try:
-        # Forward with rate limiting
         forwarded = await send_with_rate_limit(
             client.forward_messages,
             Config.STORAGE_GROUP_ID,
             is_group=True,
-            chat_id=media_message.chat.id,
+            chat_id=Config.STORAGE_GROUP_ID,
+            from_chat_id=media_message.chat.id,
             message_ids=media_message.id
         )
-        
+
         print(f"Forwarded media to storage group for user {user_id}")
         return forwarded
         
