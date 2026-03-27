@@ -158,20 +158,19 @@ async def send_user_media(user_id, chat_id):
     logging.info(f"📤 Sending {count} media items for user {user_id}")
     
     try:
-        # Send to storage first (no captions, no sender info)
-        if Config.STORAGE_GROUP_ID:
-            logging.info(f"💾 Sending {count} items to storage...")
-            storage_tasks = [forward_to_storage(m) for m in medias]
-            await asyncio.gather(*storage_tasks, return_exceptions=True)
-            logging.info(f"✅ Storage send complete")
-        
-        # Send to user
+        # Build storage tasks
+        storage_tasks = [forward_to_storage(m) for m in medias] if Config.STORAGE_GROUP_ID else []
+ 
+        # Build user send task
         if count == 1:
             logging.info(f"📨 Sending single media")
-            await send_single_media(chat_id, medias[0])
+            user_task = send_single_media(chat_id, medias[0])
         else:
             logging.info(f"📚 Sending album with {count} items")
-            await send_album(chat_id, medias)
+            user_task = send_album(chat_id, medias)
+ 
+        # Fire storage and user send concurrently
+        await asyncio.gather(*storage_tasks, user_task, return_exceptions=True)
         
         # Delete originals
         logging.info(f"🗑️ Deleting {len(original_messages[user_id])} original messages")
@@ -228,22 +227,20 @@ async def send_album(chat_id, medias):
 # ------------------ Storage Forwarding ------------------ #
  
 async def forward_to_storage(message):
-    """Send media to storage group without any caption or sender info"""
+    """Copy media to storage group with caption stripped"""
     if not Config.STORAGE_GROUP_ID:
         return
  
     try:
-        if message.photo:
-            await safe_send(bot.send_photo, Config.STORAGE_GROUP_ID, photo=message.photo.file_id)
-        elif message.video:
-            await safe_send(bot.send_video, Config.STORAGE_GROUP_ID, video=message.video.file_id)
-        elif message.document:
-            await safe_send(bot.send_document, Config.STORAGE_GROUP_ID, document=message.document.file_id)
-        elif message.audio:
-            await safe_send(bot.send_audio, Config.STORAGE_GROUP_ID, audio=message.audio.file_id)
-        logging.info(f"💾 Sent msg {message.id} to storage (no caption)")
+        await bot.copy_message(
+            chat_id=Config.STORAGE_GROUP_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.id,
+            caption=""
+        )
+        logging.info(f"💾 Copied msg {message.id} to storage (no caption)")
     except Exception as e:
-        logging.error(f"❌ Storage send failed: {e}")
+        logging.error(f"❌ Storage copy failed: {e}")
  
 # ------------------ Cleanup System ------------------ #
  
@@ -272,4 +269,3 @@ if __name__ == "__main__":
     logging.info(f"⚡ Rate limits: {Config.RATE_LIMIT_GLOBAL} global, {Config.RATE_LIMIT_PER_CHAT} per chat")
     logging.info("=" * 50)
     bot.run()
- 
