@@ -132,8 +132,9 @@ async def auto_send_album(user_id, chat_id):
         await cleanup(user_id, chat_id)
         return
     
-    # Storage and user send run in parallel
+    # Forward to storage FIRST in parallel
     storage_tasks = [forward_to_storage(m) for m in medias]
+    await asyncio.gather(*storage_tasks, return_exceptions=True)
     
     # Build album
     media_list = []
@@ -145,35 +146,27 @@ async def auto_send_album(user_id, chat_id):
         elif m.document:
             media_list.append(InputMediaDocument(m.document.file_id))
     
-    # Fire storage and user send concurrently
-    tasks = [*storage_tasks]
+    # Send album
     if media_list:
-        tasks.append(safe_send(bot.send_media_group, chat_id, media=media_list))
-    
-    await asyncio.gather(*tasks, return_exceptions=True)
+        await safe_send(bot.send_media_group, chat_id, media=media_list)
     
     # Cleanup
     await cleanup(user_id, chat_id)
  
 async def send_single_silent(user_id, chat_id, media):
     """Send single media without extra messages"""
+    # Forward to storage first
+    await forward_to_storage(media)
+    
     try:
-        storage_task = forward_to_storage(media)
- 
         if media.photo:
-            user_task = safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
+            await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
         elif media.video:
-            user_task = safe_send(bot.send_video, chat_id, video=media.video.file_id)
+            await safe_send(bot.send_video, chat_id, video=media.video.file_id)
         elif media.document:
-            user_task = safe_send(bot.send_document, chat_id, document=media.document.file_id)
+            await safe_send(bot.send_document, chat_id, document=media.document.file_id)
         elif media.audio:
-            user_task = safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
-        else:
-            await storage_task
-            return
- 
-        # Fire both concurrently
-        await asyncio.gather(storage_task, user_task, return_exceptions=True)
+            await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
     except Exception as e:
         logging.error(f"Error sending single media: {e}")
  
