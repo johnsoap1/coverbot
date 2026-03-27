@@ -132,9 +132,8 @@ async def auto_send_album(user_id, chat_id):
         await cleanup(user_id, chat_id)
         return
     
-    # Forward to storage FIRST in parallel
+    # Storage and user send run in parallel
     storage_tasks = [forward_to_storage(m) for m in medias]
-    await asyncio.gather(*storage_tasks, return_exceptions=True)
     
     # Build album
     media_list = []
@@ -146,48 +145,54 @@ async def auto_send_album(user_id, chat_id):
         elif m.document:
             media_list.append(InputMediaDocument(m.document.file_id))
     
-    # Send album
+    # Fire storage and user send concurrently
+    tasks = [*storage_tasks]
     if media_list:
-        await safe_send(bot.send_media_group, chat_id, media=media_list)
+        tasks.append(safe_send(bot.send_media_group, chat_id, media=media_list))
+    
+    await asyncio.gather(*tasks, return_exceptions=True)
     
     # Cleanup
     await cleanup(user_id, chat_id)
  
 async def send_single_silent(user_id, chat_id, media):
     """Send single media without extra messages"""
-    # Forward to storage first
-    await forward_to_storage(media)
-    
     try:
+        storage_task = forward_to_storage(media)
+ 
         if media.photo:
-            await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
+            user_task = safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
         elif media.video:
-            await safe_send(bot.send_video, chat_id, video=media.video.file_id)
+            user_task = safe_send(bot.send_video, chat_id, video=media.video.file_id)
         elif media.document:
-            await safe_send(bot.send_document, chat_id, document=media.document.file_id)
+            user_task = safe_send(bot.send_document, chat_id, document=media.document.file_id)
         elif media.audio:
-            await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
+            user_task = safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
+        else:
+            await storage_task
+            return
+ 
+        # Fire both concurrently
+        await asyncio.gather(storage_task, user_task, return_exceptions=True)
     except Exception as e:
         logging.error(f"Error sending single media: {e}")
  
 # ------------------ Storage Forwarding ------------------ #
  
 async def forward_to_storage(message):
-    """Send media to storage group without any caption or sender info"""
+    """Copy media to storage group with caption stripped"""
     if not Config.STORAGE_GROUP_ID:
         return
  
     try:
-        if message.photo:
-            await safe_send(bot.send_photo, Config.STORAGE_GROUP_ID, photo=message.photo.file_id)
-        elif message.video:
-            await safe_send(bot.send_video, Config.STORAGE_GROUP_ID, video=message.video.file_id)
-        elif message.document:
-            await safe_send(bot.send_document, Config.STORAGE_GROUP_ID, document=message.document.file_id)
-        elif message.audio:
-            await safe_send(bot.send_audio, Config.STORAGE_GROUP_ID, audio=message.audio.file_id)
+        await bot.copy_message(
+            chat_id=Config.STORAGE_GROUP_ID,
+            from_chat_id=message.chat.id,
+            message_id=message.id,
+            caption=""
+        )
     except Exception as e:
-        logging.error(f"Storage send failed: {e}")
+        logging.error(f"Storage forward failed: {e}")
  
 # ------------------ Cleanup System ------------------ #
  
@@ -209,3 +214,4 @@ if __name__ == "__main__":
     logging.info("Starting Anonymous Forward Bot...")
     logging.info(f"Max album size: {Config.MAX_ALBUM_SIZE}")
     bot.run()
+ 
