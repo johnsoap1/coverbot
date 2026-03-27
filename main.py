@@ -158,19 +158,20 @@ async def send_user_media(user_id, chat_id):
     logging.info(f"📤 Sending {count} media items for user {user_id}")
     
     try:
-        # Build storage tasks
-        storage_tasks = [forward_to_storage(m) for m in medias] if Config.STORAGE_GROUP_ID else []
- 
-        # Build user send task
+        # Forward to storage first (ONLY user messages)
+        if Config.STORAGE_GROUP_ID:
+            logging.info(f"💾 Forwarding {count} items to storage...")
+            storage_tasks = [forward_to_storage(m) for m in medias]
+            await asyncio.gather(*storage_tasks, return_exceptions=True)
+            logging.info(f"✅ Storage forwarding complete")
+        
+        # Send to user
         if count == 1:
             logging.info(f"📨 Sending single media")
-            user_task = send_single_media(chat_id, medias[0])
+            await send_single_media(chat_id, medias[0])
         else:
             logging.info(f"📚 Sending album with {count} items")
-            user_task = send_album(chat_id, medias)
- 
-        # Fire storage and user send concurrently
-        await asyncio.gather(*storage_tasks, user_task, return_exceptions=True)
+            await send_album(chat_id, medias)
         
         # Delete originals
         logging.info(f"🗑️ Deleting {len(original_messages[user_id])} original messages")
@@ -231,16 +232,19 @@ async def forward_to_storage(message):
     if not Config.STORAGE_GROUP_ID:
         return
  
-    try:
-        await bot.copy_message(
-            chat_id=Config.STORAGE_GROUP_ID,
-            from_chat_id=message.chat.id,
-            message_id=message.id,
-            caption=""
-        )
-        logging.info(f"💾 Copied msg {message.id} to storage (no caption)")
-    except Exception as e:
-        logging.error(f"❌ Storage copy failed: {e}")
+    if message.from_user and message.from_user.id != BOT_ID:
+        try:
+            await bot.copy_message(
+                chat_id=Config.STORAGE_GROUP_ID,
+                from_chat_id=message.chat.id,
+                message_id=message.id,
+                caption=""
+            )
+            logging.info(f"💾 Copied msg {message.id} to storage (no caption)")
+        except Exception as e:
+            logging.error(f"❌ Storage copy failed: {e}")
+    else:
+        logging.debug(f"⏭️ Skipping storage copy (message from bot)")
  
 # ------------------ Cleanup System ------------------ #
  
@@ -269,3 +273,4 @@ if __name__ == "__main__":
     logging.info(f"⚡ Rate limits: {Config.RATE_LIMIT_GLOBAL} global, {Config.RATE_LIMIT_PER_CHAT} per chat")
     logging.info("=" * 50)
     bot.run()
+ 
