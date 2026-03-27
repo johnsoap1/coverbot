@@ -9,75 +9,75 @@ from pyrogram.types import (
     InputMediaVideo,
     InputMediaDocument,
 )
-
+ 
 from Config import Config
-
+ 
 # ------------------ Logging ------------------ #
-
+ 
 logging.basicConfig(
     level=logging.DEBUG,
     format="[%(asctime)s] %(levelname)s - %(message)s"
 )
-
+ 
 # ------------------ Bot Init ------------------ #
-
+ 
 bot = Client(
     "AnonForwardBot",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
     bot_token=Config.BOT_TOKEN
 )
-
+ 
 # Bot ID - will be set on startup
 BOT_ID = None
-
+ 
 # ------------------ State Storage ------------------ #
-
+ 
 media_groups = defaultdict(list)
 original_messages = defaultdict(list)
 user_locks = defaultdict(asyncio.Lock)
 user_send_tasks = {}
-
+ 
 last_send_time = defaultdict(float)
 global_timestamps = []
-
+ 
 # ------------------ Rate Limiter ------------------ #
-
+ 
 async def rate_limit(chat_id):
     global global_timestamps
     now = time.time()
-
+ 
     global_timestamps = [t for t in global_timestamps if now - t < 1]
-
+ 
     if len(global_timestamps) >= Config.RATE_LIMIT_GLOBAL:
         await asyncio.sleep(1)
-
+ 
     delta = now - last_send_time[chat_id]
     if delta < Config.RATE_LIMIT_PER_CHAT:
         await asyncio.sleep(Config.RATE_LIMIT_PER_CHAT - delta)
-
+ 
 async def safe_send(func, chat_id, **kwargs):
     while True:
         try:
             await rate_limit(chat_id)
             result = await func(chat_id=chat_id, **kwargs)
-
+ 
             now = time.time()
             last_send_time[chat_id] = now
             global_timestamps.append(now)
-
+ 
             return result
-
+ 
         except FloodWait as e:
             logging.warning(f"FloodWait {e.value}s")
             await asyncio.sleep(e.value)
-
+ 
         except RPCError as e:
             logging.error(f"RPCError: {e}")
             return None
-
+ 
 # ------------------ Startup ------------------ #
-
+ 
 @bot.on_message(filters.private & filters.command("start"))
 async def start(client, message):
     global BOT_ID
@@ -94,9 +94,9 @@ async def start(client, message):
         "I'm an anonymous forward bot designed to strip metadata from Telegram videos for privacy. "
         "Send me media to get started."
     )
-
+ 
 # ------------------ Media Handler ------------------ #
-
+ 
 @bot.on_message(filters.private & (filters.photo | filters.video | filters.document | filters.audio))
 async def handle_media(client, message):
     global BOT_ID
@@ -131,7 +131,7 @@ async def handle_media(client, message):
         logging.info(f"⏰ Scheduling send in 3 seconds for user {user_id}")
         task = asyncio.create_task(delayed_send(user_id, chat_id, 3.0))
         user_send_tasks[user_id] = task
-
+ 
 async def delayed_send(user_id, chat_id, delay):
     """Wait and then send media"""
     try:
@@ -142,7 +142,7 @@ async def delayed_send(user_id, chat_id, delay):
     except asyncio.CancelledError:
         logging.info(f"❌ Timer cancelled for user {user_id}")
         pass
-
+ 
 async def send_user_media(user_id, chat_id):
     """Send all queued media for a user"""
     if user_id in user_send_tasks:
@@ -158,12 +158,12 @@ async def send_user_media(user_id, chat_id):
     logging.info(f"📤 Sending {count} media items for user {user_id}")
     
     try:
-        # Forward to storage first (ONLY user messages)
+        # Send to storage first (no captions, no sender info)
         if Config.STORAGE_GROUP_ID:
-            logging.info(f"💾 Forwarding {count} items to storage...")
+            logging.info(f"💾 Sending {count} items to storage...")
             storage_tasks = [forward_to_storage(m) for m in medias]
             await asyncio.gather(*storage_tasks, return_exceptions=True)
-            logging.info(f"✅ Storage forwarding complete")
+            logging.info(f"✅ Storage send complete")
         
         # Send to user
         if count == 1:
@@ -182,9 +182,9 @@ async def send_user_media(user_id, chat_id):
     except Exception as e:
         logging.error(f"❌ Error in send_user_media: {e}", exc_info=True)
         await cleanup(user_id, chat_id)
-
+ 
 # ------------------ Send Functions ------------------ #
-
+ 
 async def send_single_media(chat_id, media):
     """Send a single media item"""
     try:
@@ -199,7 +199,7 @@ async def send_single_media(chat_id, media):
     except Exception as e:
         logging.error(f"❌ Error sending single media: {e}")
         raise
-
+ 
 async def send_album(chat_id, medias):
     """Send multiple media as an album"""
     media_list = []
@@ -224,31 +224,29 @@ async def send_album(chat_id, medias):
     
     logging.info(f"📚 Sending album with {len(media_list)} items")
     await safe_send(bot.send_media_group, chat_id, media=media_list)
-
+ 
 # ------------------ Storage Forwarding ------------------ #
-
+ 
 async def forward_to_storage(message):
-    """Forward media to storage group - ONLY from users, not bot"""
+    """Send media to storage group without any caption or sender info"""
     if not Config.STORAGE_GROUP_ID:
         return
-    
-    # Only forward original user messages, not bot's re-sent messages
-    if message.from_user and message.from_user.id != BOT_ID:
-        try:
-            await safe_send(
-                bot.forward_messages,
-                Config.STORAGE_GROUP_ID,
-                from_chat_id=message.chat.id,
-                message_ids=message.id
-            )
-            logging.info(f"💾 Forwarded msg {message.id} to storage")
-        except Exception as e:
-            logging.error(f"❌ Storage forward failed: {e}")
-    else:
-        logging.debug(f"⏭️ Skipping storage forward (message from bot)")
-
+ 
+    try:
+        if message.photo:
+            await safe_send(bot.send_photo, Config.STORAGE_GROUP_ID, photo=message.photo.file_id)
+        elif message.video:
+            await safe_send(bot.send_video, Config.STORAGE_GROUP_ID, video=message.video.file_id)
+        elif message.document:
+            await safe_send(bot.send_document, Config.STORAGE_GROUP_ID, document=message.document.file_id)
+        elif message.audio:
+            await safe_send(bot.send_audio, Config.STORAGE_GROUP_ID, audio=message.audio.file_id)
+        logging.info(f"💾 Sent msg {message.id} to storage (no caption)")
+    except Exception as e:
+        logging.error(f"❌ Storage send failed: {e}")
+ 
 # ------------------ Cleanup System ------------------ #
-
+ 
 async def cleanup(user_id, chat_id):
     """Clean up user data and delete original messages"""
     msg_ids = original_messages[user_id].copy()
@@ -259,12 +257,12 @@ async def cleanup(user_id, chat_id):
             await asyncio.sleep(0.05)
         except Exception as e:
             logging.debug(f"Delete failed for msg {msg_id}: {e}")
-
+ 
     media_groups[user_id].clear()
     original_messages[user_id].clear()
-
+ 
 # ------------------ Bot Start ------------------ #
-
+ 
 if __name__ == "__main__":
     logging.info("=" * 50)
     logging.info("🚀 Starting Anonymous Forward Bot")
@@ -274,3 +272,4 @@ if __name__ == "__main__":
     logging.info(f"⚡ Rate limits: {Config.RATE_LIMIT_GLOBAL} global, {Config.RATE_LIMIT_PER_CHAT} per chat")
     logging.info("=" * 50)
     bot.run()
+ 
