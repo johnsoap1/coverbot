@@ -40,6 +40,13 @@ global_timestamps = []
 processed_groups = set()  # NEW: Track processed media groups
 start_time = time.time()
 
+# ------------------ Ignore List ------------------
+ignored_users = set()  # user_ids that won't be forwarded to storage
+
+class InvalidFileError(Exception):
+    """Raised when a file_id is invalid and shouldn't be retried."""
+    pass
+
 # ------------------ Rate Limiter ------------------
 async def rate_limit(chat_id):
     global global_timestamps
@@ -66,6 +73,10 @@ async def safe_send(func, chat_id, **kwargs):
             logging.warning(f"FloodWait {e.value}s")
             await asyncio.sleep(e.value)
         except RPCError as e:
+            # Bad file_id — don't retry, raise up so caller can handle it
+            if e.CODE == 400 and "FILE_ID_INVALID" in str(e).upper():
+                logging.warning(f"Invalid file_id in {func.__name__}: {e}")
+                raise InvalidFileError(str(e))
             logging.error(f"RPCError in safe_send {func.__name__}: {e}")
             return None
 
@@ -103,6 +114,84 @@ async def start(client, message):
         "I'm an anonymous forward bot designed to strip metadata from Telegram media for privacy. "
         "Send me media to get started."
     )
+
+@bot.on_message(filters.command("ignore") & filters.reply)
+async def ignore_user_command(client, message):
+    """Allow storage group members to ignore a user from storage forwarding."""
+    
+    # Only allow from storage group
+    if not Config.STORAGE_GROUP_ID or message.chat.id != Config.STORAGE_GROUP_ID:
+        return
+    
+    replied = message.reply_to_message
+    if not replied:
+        await message.reply_text("❌ Reply to a forwarded message to ignore that user.")
+        return
+    
+    # Get the original sender's ID from the forwarded message
+    target_user_id = None
+    target_name = "Unknown"
+    
+    if replied.forward_from:
+        target_user_id = replied.forward_from.id
+        target_name = replied.forward_from.first_name or str(target_user_id)
+    elif replied.forward_sender_name:
+        # User has hidden their account - can't get ID
+        await message.reply_text(
+            "⚠️ This user has hidden their account. Cannot retrieve their ID to ignore them."
+        )
+        return
+    else:
+        await message.reply_text("❌ Could not identify the original sender of this message.")
+        return
+    
+    if target_user_id in ignored_users:
+        await message.reply_text(f"ℹ️ User **{target_name}** (`{target_user_id}`) is already ignored.")
+        return
+    
+    ignored_users.add(target_user_id)
+    logging.info(f"User {target_user_id} ({target_name}) added to ignore list by {message.from_user.id}")
+    
+    # Delete all messages in storage group from this user
+    deleted_count = 0
+    async for msg in client.search_messages(Config.STORAGE_GROUP_ID, from_user=target_user_id):
+        try:
+            await client.delete_messages(Config.STORAGE_GROUP_ID, msg.id)
+            deleted_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            logging.warning(f"Could not delete storage msg {msg.id}: {e}")
+    
+    await message.reply_text(
+        f"✅ **{target_name}** (`{target_user_id}`) is now ignored.\n"
+        f"🗑️ Deleted **{deleted_count}** of their messages from storage.\n"
+        f"Their media will no longer be forwarded here."
+    )
+
+
+@bot.on_message(filters.command("unignore") & filters.reply)
+async def unignore_user_command(client, message):
+    """Remove a user from the ignore list."""
+    
+    if not Config.STORAGE_GROUP_ID or message.chat.id != Config.STORAGE_GROUP_ID:
+        return
+    
+    replied = message.reply_to_message
+    if not replied or not replied.forward_from:
+        await message.reply_text("❌ Reply to a forwarded message to unignore that user.")
+        return
+    
+    target_user_id = replied.forward_from.id
+    target_name = replied.forward_from.first_name or str(target_user_id)
+    
+    if target_user_id not in ignored_users:
+        await message.reply_text(f"ℹ️ User **{target_name}** (`{target_user_id}`) is not ignored.")
+        return
+    
+    ignored_users.discard(target_user_id)
+    logging.info(f"User {target_user_id} ({target_name}) removed from ignore list by {message.from_user.id}")
+    
+    await message.reply_text(f"✅ **{target_name}** (`{target_user_id}`) has been unignored. Their media will now be forwarded to storage again.")
 
 @bot.on_message(filters.private & (filters.photo | filters.video | filters.document) & ~filters.me)
 async def handle_media(client, message):
@@ -197,84 +286,58 @@ async def auto_send_album(user_id, chat_id):
         await cleanup(user_id, chat_id)
         return
     
-    # Forward entire album to storage as group
+    # Forward entire album to storage as group (skip ignored users)
     if Config.STORAGE_GROUP_ID:
         logging.info(f"auto_send_album: Forwarding album of {count} to storage")
         try:
-            message_ids = [m.id for m in medias]
-            await safe_send(
-                bot.forward_messages,
-                Config.STORAGE_GROUP_ID,
-                from_chat_id=chat_id,
-                message_ids=message_ids
-            )
+            # Filter out ignored users
+            valid_medias = [m for m in medias if m.from_user and m.from_user.id not in ignored_users]
+            if valid_medias:
+                message_ids = [m.id for m in valid_medias]
+                await safe_send(
+                    bot.forward_messages,
+                    Config.STORAGE_GROUP_ID,
+                    from_chat_id=chat_id,
+                    message_ids=message_ids
+                )
+                if len(valid_medias) < count:
+                    logging.info(f"Skipped {count - len(valid_medias)} ignored users from storage")
         except Exception as e:
             logging.error(f"Storage album forward failed: {e}")
     
-    # Build media list
-    all_media = []
-    for i, m in enumerate(medias):
-        logging.debug(f"Building media_list[{i}]: {m.media}")
-        if m.photo:
-            all_media.append(InputMediaPhoto(m.photo.file_id))
-        elif m.video:
-            all_media.append(InputMediaVideo(m.video.file_id))
-        elif m.document:
-            all_media.append(InputMediaDocument(m.document.file_id))
+    # Use new send_album function with invalid file handling
+    success = await send_album(chat_id, medias)
     
-    logging.info(f"media_list built: {len(all_media)} items")
-    
-    # Split into chunks of 10 (Telegram's limit)
-    CHUNK_SIZE = 10
-    total_chunks = (len(all_media) + CHUNK_SIZE - 1) // CHUNK_SIZE
-    success_count = 0
-    
-    for i in range(0, len(all_media), CHUNK_SIZE):
-        chunk = all_media[i:i+CHUNK_SIZE]
-        chunk_num = (i // CHUNK_SIZE) + 1
-        
-        logging.info(f"Sending chunk {chunk_num}/{total_chunks} with {len(chunk)} items")
-        result = await safe_send(bot.send_media_group, chat_id, media=chunk)
-        
-        if result:
-            success_count += 1
-            logging.info(f"Chunk {chunk_num}/{total_chunks} sent successfully")
-        else:
-            logging.error(f"Failed to send chunk {chunk_num}/{total_chunks}")
-            await bot.send_message(chat_id, "⚠️ Some media failed to send. Please try again.")
-            logging.info(f"=== AUTO_SEND_ALBUM END (FAILED) user={user_id} ===")
-            return  # Don't cleanup on failure
-        
-        # Small delay between chunks to avoid flood
-        if i + CHUNK_SIZE < len(all_media):
-            await asyncio.sleep(0.5)
-    
-    # Only cleanup if all chunks sent successfully
-    if success_count == total_chunks:
-        logging.info(f"All {total_chunks} chunks sent successfully, cleaning up")
+    if success:
+        logging.info(f"Album sent successfully, cleaning up")
         await cleanup(user_id, chat_id)
     else:
-        logging.warning(f"Only {success_count}/{total_chunks} chunks succeeded, skipping cleanup")
+        logging.warning(f"Album send failed, skipping cleanup")
     
     logging.info(f"=== AUTO_SEND_ALBUM END user={user_id} ===")
 
 async def send_single_silent(user_id, chat_id, media):
     logging.info(f"=== SINGLE SEND: user={user_id}, media={media.media} ===")
     
-    # Forward to storage first
+    # Forward to storage first (skip ignored users)
     if Config.STORAGE_GROUP_ID:
-        try:
-            await safe_send(
-                bot.forward_messages,
-                Config.STORAGE_GROUP_ID,
-                from_chat_id=chat_id,
-                message_ids=media.id
-            )
-        except Exception as e:
-            logging.error(f"Storage forward failed: {e}")
+        if not media.from_user or media.from_user.id not in ignored_users:
+            try:
+                await safe_send(
+                    bot.forward_messages,
+                    Config.STORAGE_GROUP_ID,
+                    from_chat_id=chat_id,
+                    message_ids=media.id
+                )
+            except InvalidFileError:
+                logging.warning(f"Storage forward skipped — invalid file_id for msg {media.id}")
+            except Exception as e:
+                logging.error(f"Storage forward failed: {e}")
+        else:
+            logging.info(f"Skipping storage forward for ignored user {media.from_user.id}")
     
-    # Send the media
     result = None
+    invalid = False
     try:
         if media.photo:
             logging.info("Sending photo")
@@ -288,14 +351,94 @@ async def send_single_silent(user_id, chat_id, media):
         elif media.audio:
             logging.info("Sending audio")
             result = await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
+    except InvalidFileError:
+        invalid = True
+        logging.warning(f"Invalid file_id for user {user_id}, msg {media.id} — notifying user")
     except Exception as e:
         logging.error(f"Error sending single media: {e}")
+    
+    if invalid:
+        # Don't delete originals — notify user and bail without wiping
+        await bot.send_message(
+            chat_id,
+            "⚠️ Some files could not be processed. This can happen if Telegram has flagged or restricted the file. "
+            "The original message has been kept so you can try again or use a different file."
+        )
+        # Remove only this message from tracking so cleanup doesn't delete it
+        if media.id in original_messages[user_id]:
+            original_messages[user_id].remove(media.id)
+        return
     
     if not result:
         logging.error("Single send failed, skipping cleanup")
         await bot.send_message(chat_id, "⚠️ Failed to send media. Please try again.")
     
     logging.info(f"=== SINGLE SEND END ===")
+
+async def send_single_by_media(chat_id, media):
+    """Helper to send one media item — raises InvalidFileError if bad file_id."""
+    if media.photo:
+        await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
+    elif media.video:
+        await safe_send(bot.send_video, chat_id, video=media.video.file_id)
+    elif media.document:
+        await safe_send(bot.send_document, chat_id, document=media.document.file_id)
+    elif media.audio:
+        await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
+
+async def send_album(chat_id, medias):
+    """Send multiple media as an album, skipping invalid file_ids."""
+    media_list = []
+    skipped = 0
+    
+    for m in medias:
+        try:
+            if m.photo:
+                media_list.append(InputMediaPhoto(m.photo.file_id))
+            elif m.video:
+                media_list.append(InputMediaVideo(m.video.file_id))
+            elif m.document:
+                media_list.append(InputMediaDocument(m.document.file_id))
+            elif m.audio:
+                logging.warning(f"⚠️ Skipping audio in album")
+                skipped += 1
+                continue
+        except Exception as e:
+            logging.error(f"❌ Error building album item: {e}")
+            skipped += 1
+    
+    if not media_list:
+        logging.error(f"❌ No valid media in album!")
+        await bot.send_message(chat_id, "⚠️ None of the files could be processed. They may be flagged or restricted by Telegram.")
+        return False
+    
+    try:
+        await safe_send(bot.send_media_group, chat_id, media=media_list)
+    except InvalidFileError:
+        logging.warning("Album failed due to invalid file_id — trying items one by one")
+        sent = 0
+        failed = 0
+        for m in medias:
+            try:
+                await send_single_by_media(chat_id, m)
+                sent += 1
+            except InvalidFileError:
+                failed += 1
+                logging.warning(f"Skipping invalid file in album fallback: msg {m.id}")
+            await asyncio.sleep(0.3)
+        
+        if failed:
+            await bot.send_message(
+                chat_id,
+                f"⚠️ {failed} file(s) could not be processed and were skipped. "
+                f"This can happen if Telegram has flagged or restricted the file."
+            )
+        return sent > 0
+    
+    if skipped:
+        await bot.send_message(chat_id, f"⚠️ {skipped} file(s) could not be processed and were skipped.")
+    
+    return True
 
 # ------------------ Storage & Cleanup ------------------
 async def cleanup(user_id, chat_id):
