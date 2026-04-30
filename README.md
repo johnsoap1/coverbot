@@ -10,6 +10,9 @@ A Telegram bot that forwards messages anonymously with rate limiting, album supp
 - **Storage Group**: Store media in a designated group
 - **Delete Original**: Option to delete original messages after forwarding
 - **Thread-Safe**: Concurrent user handling with proper locking
+- **Ignore List**: Block specific users from storage forwarding
+- **Bad File ID Handling**: Gracefully handle invalid or flagged files
+- **Graceful Shutdown**: Flush pending media before exit
 
 ## Requirements
 
@@ -198,6 +201,31 @@ docker run -d --name anonbot --restart unless-stopped anonbot
 - **RATE_LIMIT_PER_CHAT**: Messages per second per chat (default: 1)
 - **RATE_LIMIT_GLOBAL**: Global messages per second (default: 30)
 - **MAX_ALBUM_SIZE**: Maximum media items in an album (default: 10)
+
+## Storage Group Commands
+
+When `STORAGE_GROUP_ID` is configured, the following commands are available in the storage group:
+
+- `/ignore` (reply to a forwarded message): Add the original sender to the ignore list. Their media will no longer be forwarded to storage, and all their existing messages in storage will be deleted.
+- `/unignore` (reply to a forwarded message): Remove a user from the ignore list. Their media will be forwarded to storage again.
+- `/ignored`: List all currently ignored user IDs.
+
+The ignore list is persisted to `ignored_users.json` and survives bot restarts.
+
+## Error Handling
+
+### Invalid File IDs
+The bot gracefully handles Telegram's 400/FILE_ID_INVALID errors:
+- **Single media**: The user is notified, and the original message is preserved (not auto-deleted)
+- **Albums**: The bot attempts to send each item individually, skipping invalid files and reporting how many were skipped
+
+### Graceful Shutdown
+The bot catches SIGINT and SIGTERM signals to flush pending media before exiting, preventing data loss during restarts or deployments.
+
+### Memory Management
+- Background cleanup task removes stale user sessions every 10 minutes
+- Global timestamp list is capped at 500 entries to prevent unbounded memory growth
+- Lock cleanup guards against deleting held locks to prevent user blocking
 
 ## Troubleshooting
 

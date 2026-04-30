@@ -1,6 +1,9 @@
 import asyncio
 import time
 import logging
+import json
+import os
+import signal
 from collections import defaultdict
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
@@ -41,7 +44,25 @@ processed_groups = set()  # NEW: Track processed media groups
 start_time = time.time()
 
 # ------------------ Ignore List ------------------
-ignored_users = set()  # user_ids that won't be forwarded to storage
+IGNORE_FILE = "ignored_users.json"
+
+def load_ignored_users():
+    if os.path.exists(IGNORE_FILE):
+        try:
+            with open(IGNORE_FILE, "r") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+def save_ignored_users():
+    try:
+        with open(IGNORE_FILE, "w") as f:
+            json.dump(list(ignored_users), f)
+    except Exception as e:
+        logging.error(f"Failed to save ignored_users: {e}")
+
+ignored_users = load_ignored_users()  # user_ids that won't be forwarded to storage
 
 class InvalidFileError(Exception):
     """Raised when a file_id is invalid and shouldn't be retried."""
@@ -51,7 +72,7 @@ class InvalidFileError(Exception):
 async def rate_limit(chat_id):
     global global_timestamps
     now = time.time()
-    global_timestamps = [t for t in global_timestamps if now - t < 1]
+    global_timestamps = [t for t in global_timestamps if now - t < 1][-500:]
     if len(global_timestamps) >= Config.RATE_LIMIT_GLOBAL:
         await asyncio.sleep(1)
     delta = now - last_send_time[chat_id]
@@ -98,9 +119,13 @@ async def cleanup_stale_sessions():
             media_groups.pop(user_id, None)
             original_messages.pop(user_id, None)
             last_send_time.pop(user_id, None)
-            # Clean up locks (they auto-recreate)
+            
             if user_id in user_locks:
-                del user_locks[user_id]
+                lock = user_locks[user_id]
+                if lock.locked():
+                    logging.warning(f"Stale lock still held for user {user_id} — skipping lock removal to avoid corruption")
+                else:
+                    del user_locks[user_id]
 
 # ------------------ Core Handlers ------------------
 @bot.on_message(filters.private & filters.command("start"))
@@ -151,6 +176,7 @@ async def ignore_user_command(client, message):
     
     ignored_users.add(target_user_id)
     logging.info(f"User {target_user_id} ({target_name}) added to ignore list by {message.from_user.id}")
+    save_ignored_users()
     
     # Delete all messages in storage group from this user
     deleted_count = 0
@@ -190,8 +216,21 @@ async def unignore_user_command(client, message):
     
     ignored_users.discard(target_user_id)
     logging.info(f"User {target_user_id} ({target_name}) removed from ignore list by {message.from_user.id}")
+    save_ignored_users()
     
     await message.reply_text(f"✅ **{target_name}** (`{target_user_id}`) has been unignored. Their media will now be forwarded to storage again.")
+
+@bot.on_message(filters.command("ignored"))
+async def list_ignored(client, message):
+    if not Config.STORAGE_GROUP_ID or message.chat.id != Config.STORAGE_GROUP_ID:
+        return
+
+    if not ignored_users:
+        await message.reply_text("✅ No users are currently ignored.")
+        return
+
+    lines = [f"• `{uid}`" for uid in sorted(ignored_users)]
+    await message.reply_text("🚫 **Ignored users:**\n" + "\n".join(lines))
 
 @bot.on_message(filters.private & (filters.photo | filters.video | filters.document) & ~filters.me)
 async def handle_media(client, message):
@@ -465,5 +504,25 @@ if __name__ == "__main__":
     # Start background cleanup task
     bot.loop.create_task(cleanup_stale_sessions())
     logging.info("Background cleanup task started (runs every 10 minutes)")
+    
+    # Graceful shutdown handler
+    async def shutdown_handler():
+        logging.info("Shutdown signal received — flushing pending media...")
+        tasks = []
+        for user_id, medias in list(media_groups.items()):
+            if medias:
+                chat_id = medias[0].chat.id
+                logging.info(f"Flushing {len(medias)} items for user {user_id}")
+                tasks.append(auto_send_album(user_id, chat_id))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        logging.info("Flush complete. Shutting down.")
+
+    def handle_signal(sig, frame):
+        loop = asyncio.get_event_loop()
+        loop.create_task(shutdown_handler())
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
     
     bot.run()
