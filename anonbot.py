@@ -4,23 +4,15 @@ import logging
 import logging.handlers
 import json
 import os
-import signal
 import traceback
 from collections import defaultdict
 from pyrogram import Client, filters
 from pyrogram.errors import FloodWait, RPCError
-from pyrogram.types import (
-    InputMediaPhoto,
-    InputMediaVideo,
-    InputMediaDocument,
-)
-
+from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from Config import Config
 
-# ── Log channel (set in Config) ──────────────────────────────
-# Config.LOG_CHANNEL_ID = -100xxxxxxxxxx  (your log group/channel)
-
-LOG_FORMAT = "[%(asctime)s] [%(levelname)-8s] %(message)s"
+# ── Logging setup ────────────────────────────────────────────
+LOG_FORMAT  = "[%(asctime)s] [%(levelname)-8s] [%(name)s] %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 os.makedirs("logs", exist_ok=True)
@@ -28,34 +20,33 @@ os.makedirs("logs", exist_ok=True)
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 
-# Console — DEBUG+
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
-console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+# Console — INFO+ only (keeps terminal clean)
+_ch = logging.StreamHandler()
+_ch.setLevel(logging.INFO)
+_ch.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
 
-# Rolling file — DEBUG+ (7 day retention)
-file_handler = logging.handlers.TimedRotatingFileHandler(
+# Rotating file — DEBUG+ (7 day retention)
+_fh = logging.handlers.TimedRotatingFileHandler(
     "logs/bot.log", when="midnight", backupCount=7, encoding="utf-8"
 )
-file_handler.setLevel(logging.DEBUG)
-file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
 
-# Errors-only file
-error_handler = logging.handlers.RotatingFileHandler(
+# Errors-only file — WARNING+
+_eh = logging.handlers.RotatingFileHandler(
     "logs/errors.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
 )
-error_handler.setLevel(logging.WARNING)
-error_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
+_eh.setLevel(logging.WARNING)
+_eh.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
 
-root_logger.addHandler(console_handler)
-root_logger.addHandler(file_handler)
-root_logger.addHandler(error_handler)
+root_logger.addHandler(_ch)
+root_logger.addHandler(_fh)
+root_logger.addHandler(_eh)
 
-# Silence pyrogram's own noise
-logging.getLogger("pyrogram").setLevel(logging.WARNING)
-logging.getLogger("pyrogram.client").setLevel(logging.WARNING)
-logging.getLogger("pyrogram.session").setLevel(logging.WARNING)
-logging.getLogger("pyrogram.connection").setLevel(logging.WARNING)
+# Silence pyrogram internals
+for _n in ("pyrogram", "pyrogram.client", "pyrogram.session",
+           "pyrogram.connection", "pyrogram.dispatcher"):
+    logging.getLogger(_n).setLevel(logging.WARNING)
 
 log = logging.getLogger("AnonBot")
 
@@ -64,71 +55,18 @@ bot = Client(
     "AnonForwardBot",
     api_id=Config.API_ID,
     api_hash=Config.API_HASH,
-    bot_token=Config.BOT_TOKEN
+    bot_token=Config.BOT_TOKEN,
 )
 
-# ── Telegram log channel handler ────────────────────────────
-
-class TelegramLogHandler(logging.Handler):
-    """Sends WARNING+ logs to a Telegram channel/group asynchronously."""
-
-    ICONS = {
-        logging.DEBUG:    "🔍",
-        logging.INFO:     "ℹ️",
-        logging.WARNING:  "⚠️",
-        logging.ERROR:    "❌",
-        logging.CRITICAL: "🚨",
-    }
-
-    def __init__(self, bot_client, channel_id):
-        super().__init__(level=logging.DEBUG)
-        self.bot_client = bot_client
-        self.channel_id = channel_id
-        self._queue = asyncio.Queue()
-        self._task = None
-
-    def start(self):
-        """Call once the event loop is running."""
-        self._task = asyncio.create_task(self._worker())
-
-    def emit(self, record):
-        try:
-            self._queue.put_nowait(record)
-        except asyncio.QueueFull:
-            pass  # Drop if queue is full — never block the bot
-
-    async def _worker(self):
-        while True:
-            record = await self._queue.get()
-            try:
-                icon = self.ICONS.get(record.levelno, "📋")
-                level = record.levelname
-                msg = self.format(record)
-
-                # Append traceback for exceptions
-                if record.exc_info:
-                    tb = "".join(traceback.format_exception(*record.exc_info))
-                    text = f"{icon} <b>[{level}]</b>\n<code>{msg}</code>\n\n<pre>{tb[:1500]}</pre>"
-                else:
-                    text = f"{icon} <b>[{level}]</b>\n<code>{msg}</code>"
-
-                await self.bot_client.send_message(
-                    self.channel_id,
-                    text,
-                    parse_mode="html",
-                    disable_notification=(record.levelno < logging.ERROR)
-                )
-            except Exception:
-                pass  # Never let logging crash the bot
-            finally:
-                self._queue.task_done()
-                await asyncio.sleep(0.5)  # Respect Telegram rate limits on log channel
-
-tg_log_handler = None
-if Config.LOG_CHANNEL_ID:
+# Attach Telegram log handler if channel configured
+tg_log_handler: TelegramLogHandler | None = None
+if getattr(Config, "LOG_CHANNEL_ID", None):
     tg_log_handler = TelegramLogHandler(bot, Config.LOG_CHANNEL_ID)
-    tg_log_handler.setFormatter(logging.Formatter("%(name)s | %(message)s"))
+    tg_log_handler.setFormatter(logging.Formatter(
+        "%(name)s | %(funcName)s | %(message)s"
+    ))
     root_logger.addHandler(tg_log_handler)
+    log.debug("TG_LOG_HANDLER | registered (not started yet — waiting for loop)")
 
 # ------------------ State Storage ------------------
 media_groups = defaultdict(list)
@@ -162,7 +100,7 @@ def save_ignored_users():
 ignored_users = load_ignored_users()  # user_ids that won't be forwarded to storage
 
 class InvalidFileError(Exception):
-    """Raised when a file_id is invalid and shouldn't be retried."""
+    """Raised on Telegram 400 FILE_ID_INVALID — do not retry."""
     pass
 
 # ------------------ Rate Limiter ------------------
@@ -180,25 +118,38 @@ async def safe_send(func, chat_id, **kwargs):
     attempt = 0
     while True:
         attempt += 1
-        log.debug(f"safe_send | func={func.__name__} chat={chat_id} attempt={attempt} kwargs_keys={list(kwargs.keys())}")
+        log.debug(
+            f"SAFE_SEND | func={func.__name__} chat={chat_id} "
+            f"attempt={attempt} keys={list(kwargs.keys())}"
+        )
         try:
             await rate_limit(chat_id)
             result = await func(chat_id=chat_id, **kwargs)
             now = time.time()
             last_send_time[chat_id] = now
             global_timestamps.append(now)
-            log.debug(f"safe_send OK | func={func.__name__} chat={chat_id}")
+            log.debug(f"SAFE_SEND_OK | func={func.__name__} chat={chat_id}")
             return result
 
         except FloodWait as e:
-            log.warning(f"FloodWait | func={func.__name__} chat={chat_id} wait={e.value}s attempt={attempt}")
+            log.warning(
+                f"FLOOD_WAIT | func={func.__name__} chat={chat_id} "
+                f"wait={e.value}s attempt={attempt}"
+            )
             await asyncio.sleep(e.value)
 
         except RPCError as e:
-            if e.CODE == 400 and "FILE_ID_INVALID" in str(e).upper():
-                log.warning(f"InvalidFileID | func={func.__name__} chat={chat_id} error={e}")
+            err_str = str(e).upper()
+            if e.CODE == 400 and "FILE_ID_INVALID" in err_str:
+                log.warning(
+                    f"INVALID_FILE_ID | func={func.__name__} chat={chat_id} error={e}"
+                )
                 raise InvalidFileError(str(e))
-            log.error(f"RPCError | func={func.__name__} chat={chat_id} code={e.CODE} error={e}")
+            log.error(
+                f"RPC_ERROR | func={func.__name__} chat={chat_id} "
+                f"code={e.CODE} error={e}",
+                exc_info=True
+            )
             return None
 
 # ------------------ Memory Leak Prevention ------------------
@@ -332,74 +283,81 @@ async def list_ignored(client, message):
     lines = [f"• `{uid}`" for uid in sorted(ignored_users)]
     await message.reply_text("🚫 **Ignored users:**\n" + "\n".join(lines))
 
-@bot.on_message(filters.private & (filters.photo | filters.video | filters.document | filters.audio) & ~filters.me)
+@bot.on_message(
+    filters.private
+    & (filters.photo | filters.video | filters.document | filters.audio)
+    & ~filters.me
+)
 async def handle_media(client, message):
-    user_id = message.from_user.id
+    user_id    = message.from_user.id
+    chat_id    = message.chat.id
     media_type = str(message.media).split(".")[-1] if message.media else "unknown"
+    group_id   = message.media_group_id
 
-    log.info(f"MEDIA_IN | user={user_id} msg={message.id} type={media_type} group={message.media_group_id or 'none'}")
+    log.info(
+        f"MEDIA_IN | user={user_id} msg={message.id} "
+        f"type={media_type} group={group_id or 'none'}"
+    )
 
     async with user_locks[user_id]:
         media_groups[user_id].append(message)
         original_messages[user_id].append(message.id)
         count = len(media_groups[user_id])
-        log.debug(f"QUEUE | user={user_id} queued={count}")
+        log.debug(f"QUEUE | user={user_id} depth={count}")
 
-        # Cancel any pending timer — a new item arrived
         if user_id in user_send_tasks:
-            log.debug(f"TIMER_CANCEL | user={user_id}")
+            log.debug(f"TIMER_CANCEL | user={user_id} depth={count}")
             user_send_tasks[user_id].cancel()
             del user_send_tasks[user_id]
 
         if count >= Config.MAX_ALBUM_SIZE:
-            log.info(f"MAX_SIZE | user={user_id} count={count} sending immediately")
-            # Run outside the lock so send can proceed without deadlocking
-            asyncio.create_task(send_user_media(user_id, message.chat.id))
+            log.info(f"MAX_SIZE | user={user_id} count={count} firing immediately")
+            asyncio.create_task(send_user_media(user_id, chat_id))
         else:
-            delay = 1.0 if message.media_group_id else 3.0
+            delay = 1.0 if group_id else 3.0
             log.debug(f"TIMER_SET | user={user_id} delay={delay}s")
-            task = asyncio.create_task(delayed_send(user_id, message.chat.id, delay))
+            task = asyncio.create_task(delayed_send(user_id, chat_id, delay))
             user_send_tasks[user_id] = task
 
 # ------------------ Send Functions ------------------
 
+async def delayed_send(user_id, chat_id, delay):
+    try:
+        log.debug(f"TIMER_WAIT | user={user_id} delay={delay}s")
+        await asyncio.sleep(delay)
+        log.debug(f"TIMER_FIRE | user={user_id}")
+        await send_user_media(user_id, chat_id)
+    except asyncio.CancelledError:
+        log.debug(f"TIMER_CANCELLED | user={user_id}")
+
+
 async def send_user_media(user_id, chat_id):
-    if user_id in user_send_tasks:
-        del user_send_tasks[user_id]
+    user_send_tasks.pop(user_id, None)
 
     medias = media_groups[user_id].copy()
-    count = len(medias)
+    count  = len(medias)
 
     if not medias:
-        log.warning(f"SEND_EMPTY | user={user_id} nothing queued")
+        log.warning(f"SEND_EMPTY | user={user_id}")
         return
 
     log.info(f"SEND_START | user={user_id} chat={chat_id} count={count}")
-    t_start = time.time()
+    t0 = time.time()
 
     try:
         if count == 1:
-            log.debug(f"SEND_SINGLE | user={user_id}")
             await send_single_silent(user_id, chat_id, medias[0])
         else:
-            log.debug(f"SEND_ALBUM | user={user_id} count={count}")
             await auto_send_album(user_id, chat_id)
 
-        elapsed = round(time.time() - t_start, 2)
-        log.info(f"SEND_DONE | user={user_id} count={count} elapsed={elapsed}s")
-
+        log.info(
+            f"SEND_DONE | user={user_id} count={count} "
+            f"elapsed={round(time.time()-t0, 2)}s"
+        )
     except Exception as e:
         log.error(f"SEND_FATAL | user={user_id} error={e}", exc_info=True)
         media_groups[user_id].clear()
         original_messages[user_id].clear()
-
-async def delayed_send(user_id, chat_id, delay):
-    try:
-        await asyncio.sleep(delay)
-        log.debug(f"TIMER_FIRE | user={user_id} after {delay}s")
-        await send_user_media(user_id, chat_id)
-    except asyncio.CancelledError:
-        log.debug(f"TIMER_CANCELLED | user={user_id}")
 
 # ------------------ Auto Album System ------------------
 async def auto_send_album(user_id, chat_id):
@@ -527,39 +485,35 @@ async def send_single_by_media(chat_id, media):
 
 # ------------------ Storage & Cleanup ------------------
 async def forward_to_storage(message):
-    if not Config.STORAGE_GROUP_ID:
+    """Copy raw media to storage — no caption, no forward header."""
+    if not getattr(Config, "STORAGE_GROUP_ID", None):
         return
     if not message.from_user:
         log.debug(f"STORAGE_SKIP | msg={message.id} reason=no_user")
         return
     if message.from_user.id in ignored_users:
-        log.info(f"STORAGE_IGNORED | user={message.from_user.id} msg={message.id}")
+        log.debug(f"STORAGE_IGNORED | user={message.from_user.id} msg={message.id}")
         return
 
-    media_type = str(message.media).split(".")[-1] if message.media else "unknown"
-    log.debug(f"STORAGE_COPY | user={message.from_user.id} msg={message.id} type={media_type}")
-
+    log.debug(f"STORAGE_COPY | user={message.from_user.id} msg={message.id}")
     try:
         if message.photo:
-            await safe_send(bot.send_photo, Config.STORAGE_GROUP_ID, photo=message.photo.file_id)
+            await safe_send(bot.send_photo,    Config.STORAGE_GROUP_ID, photo=message.photo.file_id)
         elif message.video:
-            await safe_send(bot.send_video, Config.STORAGE_GROUP_ID, video=message.video.file_id)
+            await safe_send(bot.send_video,    Config.STORAGE_GROUP_ID, video=message.video.file_id)
         elif message.document:
             await safe_send(bot.send_document, Config.STORAGE_GROUP_ID, document=message.document.file_id)
         elif message.audio:
-            await safe_send(bot.send_audio, Config.STORAGE_GROUP_ID, audio=message.audio.file_id)
+            await safe_send(bot.send_audio,    Config.STORAGE_GROUP_ID, audio=message.audio.file_id)
         log.debug(f"STORAGE_COPY_OK | user={message.from_user.id} msg={message.id}")
     except InvalidFileError:
-        log.warning(f"STORAGE_INVALID_FILE | user={message.from_user.id} msg={message.id} skipped")
+        log.warning(f"STORAGE_INVALID_FILE | user={message.from_user.id} msg={message.id}")
     except Exception as e:
-        log.error(f"STORAGE_COPY_FAIL | user={message.from_user.id} msg={message.id} error={e}")
+        log.error(f"STORAGE_COPY_FAIL | user={message.from_user.id} msg={message.id} error={e}", exc_info=True)
 async def cleanup(user_id, chat_id):
     msg_ids = original_messages[user_id].copy()
-    count = len(msg_ids)
-    log.debug(f"CLEANUP_START | user={user_id} msgs_to_delete={count}")
-
-    deleted = 0
-    failed = 0
+    log.debug(f"CLEANUP | user={user_id} deleting={len(msg_ids)}")
+    deleted = failed = 0
     for msg_id in msg_ids:
         try:
             await bot.delete_messages(chat_id, msg_id)
@@ -567,26 +521,40 @@ async def cleanup(user_id, chat_id):
             await asyncio.sleep(0.05)
         except Exception as e:
             failed += 1
-            log.debug(f"CLEANUP_DELETE_FAIL | user={user_id} msg={msg_id} error={e}")
-
+            log.debug(f"CLEANUP_FAIL | user={user_id} msg={msg_id} error={e}")
     media_groups[user_id].clear()
     original_messages[user_id].clear()
     log.info(f"CLEANUP_DONE | user={user_id} deleted={deleted} failed={failed}")
 
 # ------------------ Bot Start ------------------
-async def on_startup(client):
-    global tg_log_handler
-    if tg_log_handler and not tg_log_handler._task:
+async def on_startup():
+    """Runs once the event loop and pyrogram session are both live."""
+    # Start Telegram log handler now that the loop exists
+    if tg_log_handler:
         tg_log_handler.start()
-        log.info("Telegram log handler started")
-    log.warning(f"BOT_ONLINE | max_album={Config.MAX_ALBUM_SIZE} storage={Config.STORAGE_GROUP_ID or 'none'} log_channel={Config.LOG_CHANNEL_ID or 'none'}")
-    asyncio.create_task(cleanup_stale_sessions())
-    log.info("Background cleanup task started")
 
-bot.on_message(filters.private & filters.command("start"))(start)
+    # Kick off background maintenance
+    asyncio.create_task(cleanup_stale_sessions())
+
+    log.warning(
+        f"BOT_ONLINE | "
+        f"max_album={Config.MAX_ALBUM_SIZE} "
+        f"storage={getattr(Config, 'STORAGE_GROUP_ID', None) or 'none'} "
+        f"log_channel={getattr(Config, 'LOG_CHANNEL_ID', None) or 'none'} "
+        f"rate_global={Config.RATE_LIMIT_GLOBAL} "
+        f"rate_per_chat={Config.RATE_LIMIT_PER_CHAT}"
+    )
+
 
 if __name__ == "__main__":
-    bot.start()
-    asyncio.get_event_loop().run_until_complete(on_startup(bot))
-    log.info("Bot is running")
-    asyncio.Event().wait()
+    async def main():
+        log.info("BOT_STARTING | connecting to Telegram...")
+        await bot.start()
+        await on_startup()
+        log.info("BOT_READY | listening for messages")
+        await asyncio.Event().wait()   # keep alive forever
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log.warning("BOT_SHUTDOWN | KeyboardInterrupt — goodbye")
