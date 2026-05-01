@@ -28,9 +28,9 @@ os.makedirs("logs", exist_ok=True)
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.DEBUG)
 
-# Console — INFO+
+# Console — DEBUG+
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 console_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
 
 # Rolling file — DEBUG+ (7 day retention)
@@ -81,7 +81,7 @@ class TelegramLogHandler(logging.Handler):
     }
 
     def __init__(self, bot_client, channel_id):
-        super().__init__(level=logging.WARNING)
+        super().__init__(level=logging.DEBUG)
         self.bot_client = bot_client
         self.channel_id = channel_id
         self._queue = asyncio.Queue()
@@ -134,6 +134,7 @@ if Config.LOG_CHANNEL_ID:
 media_groups = defaultdict(list)
 original_messages = defaultdict(list)
 user_locks = defaultdict(asyncio.Lock)
+user_send_tasks = {}
 last_send_time = defaultdict(float)
 global_timestamps = []
 processed_groups = set()  # NEW: Track processed media groups
@@ -229,15 +230,9 @@ async def cleanup_stale_sessions():
 # ------------------ Core Handlers ------------------
 @bot.on_message(filters.private & filters.command("start"))
 async def start(client, message):
-    global tg_log_handler
-    if tg_log_handler and not tg_log_handler._task:
-        tg_log_handler.start()
-        log.info("Telegram log handler started")
-
     user_name = message.from_user.first_name
     bot_name = (await client.get_me()).first_name
-    log.info(f"START command | user={message.from_user.id} name={user_name!r}")
-
+    log.info(f"START | user={message.from_user.id} name={user_name!r}")
     await message.reply_text(
         f"Hey {user_name}. \n\n"
         f"Welcome to {bot_name} \n\n"
@@ -337,81 +332,74 @@ async def list_ignored(client, message):
     lines = [f"• `{uid}`" for uid in sorted(ignored_users)]
     await message.reply_text("🚫 **Ignored users:**\n" + "\n".join(lines))
 
-@bot.on_message(filters.private & (filters.photo | filters.video | filters.document) & ~filters.me)
+@bot.on_message(filters.private & (filters.photo | filters.video | filters.document | filters.audio) & ~filters.me)
 async def handle_media(client, message):
-    group_id = message.media_group_id
     user_id = message.from_user.id
     media_type = str(message.media).split(".")[-1] if message.media else "unknown"
 
-    log.info(f"MEDIA_IN | user={user_id} msg={message.id} type={media_type} group={group_id or 'none'}")
+    log.info(f"MEDIA_IN | user={user_id} msg={message.id} type={media_type} group={message.media_group_id or 'none'}")
 
-    # Ignore bot's own messages
-    if message.from_user and message.from_user.is_bot and message.from_user.id == (await client.get_me()).id:
-        log.info("Ignoring bot's own message")
-        return
-
-    # Add media to user's queue (lock only for list manipulation)
     async with user_locks[user_id]:
         media_groups[user_id].append(message)
         original_messages[user_id].append(message.id)
         count = len(media_groups[user_id])
-        is_first = (count == 1)
-        log.debug(f"QUEUE | user={user_id} queued={count} msg={message.id}")
-    
-    # CASE 1: True album (has media_group_id)
-    if group_id:
-        group_key = f"{user_id}_{group_id}"
+        log.debug(f"QUEUE | user={user_id} queued={count}")
 
-        # Check if already being processed
-        if group_key in processed_groups:
-            log.info(f"User {user_id}: Album {group_id} already being processed, skipping")
-            return
+        # Cancel any pending timer — a new item arrived
+        if user_id in user_send_tasks:
+            log.debug(f"TIMER_CANCEL | user={user_id}")
+            user_send_tasks[user_id].cancel()
+            del user_send_tasks[user_id]
 
-        # Only first message of album processes it
-        if is_first:
-            processed_groups.add(group_key)
-            log.info(f"User {user_id}: FIRST of TRUE ALBUM {group_id}, sleeping 1s to collect all items")
-            await asyncio.sleep(1.0)
+        if count >= Config.MAX_ALBUM_SIZE:
+            log.info(f"MAX_SIZE | user={user_id} count={count} sending immediately")
+            # Run outside the lock so send can proceed without deadlocking
+            asyncio.create_task(send_user_media(user_id, message.chat.id))
+        else:
+            delay = 1.0 if message.media_group_id else 3.0
+            log.debug(f"TIMER_SET | user={user_id} delay={delay}s")
+            task = asyncio.create_task(delayed_send(user_id, message.chat.id, delay))
+            user_send_tasks[user_id] = task
 
-            async with user_locks[user_id]:
-                final_count = len(media_groups[user_id])
+# ------------------ Send Functions ------------------
 
-            log.info(f"User {user_id}: True album complete with {final_count} items, processing...")
-            await auto_send_album(user_id, message.chat.id)
-            processed_groups.discard(group_key)
+async def send_user_media(user_id, chat_id):
+    if user_id in user_send_tasks:
+        del user_send_tasks[user_id]
 
-        log.info(f"=== MEDIA HANDLER END user={user_id} ===")
+    medias = media_groups[user_id].copy()
+    count = len(medias)
+
+    if not medias:
+        log.warning(f"SEND_EMPTY | user={user_id} nothing queued")
         return
 
-    # CASE 2: Individual files (no media_group_id) - use time-based batching
-    if is_first:
-        log.info(f"User {user_id}: FIRST individual media, sleeping 2s to collect more")
-        await asyncio.sleep(2.0)
+    log.info(f"SEND_START | user={user_id} chat={chat_id} count={count}")
+    t_start = time.time()
 
-        async with user_locks[user_id]:
-            final_count = len(media_groups[user_id])
-
-        log.info(f"User {user_id}: After 2s wait, count={final_count}")
-
-        # Check if max size reached
-        if final_count >= Config.MAX_ALBUM_SIZE:
-            log.info(f"User {user_id}: MAX SIZE {Config.MAX_ALBUM_SIZE} hit, calling auto_send_album")
-            await auto_send_album(user_id, message.chat.id)
-            log.info(f"=== MEDIA HANDLER END user={user_id} ===")
-            return
-
-        # Single after wait
-        if final_count == 1:
-            log.info(f"User {user_id}: SINGLE after wait, send_single_silent")
-            await send_single_silent(user_id, message.chat.id, media_groups[user_id][0])
-            await cleanup(user_id, message.chat.id)
+    try:
+        if count == 1:
+            log.debug(f"SEND_SINGLE | user={user_id}")
+            await send_single_silent(user_id, chat_id, medias[0])
         else:
-            # Multiple individual files collected - send as album
-            log.info(f"User {user_id}: MULTIPLE individual files ({final_count}), sleep 1s then auto_send_album")
-            await asyncio.sleep(1.0)
-            await auto_send_album(user_id, message.chat.id)
+            log.debug(f"SEND_ALBUM | user={user_id} count={count}")
+            await auto_send_album(user_id, chat_id)
 
-    log.info(f"=== MEDIA HANDLER END user={user_id} ===")
+        elapsed = round(time.time() - t_start, 2)
+        log.info(f"SEND_DONE | user={user_id} count={count} elapsed={elapsed}s")
+
+    except Exception as e:
+        log.error(f"SEND_FATAL | user={user_id} error={e}", exc_info=True)
+        media_groups[user_id].clear()
+        original_messages[user_id].clear()
+
+async def delayed_send(user_id, chat_id, delay):
+    try:
+        await asyncio.sleep(delay)
+        log.debug(f"TIMER_FIRE | user={user_id} after {delay}s")
+        await send_user_media(user_id, chat_id)
+    except asyncio.CancelledError:
+        log.debug(f"TIMER_CANCELLED | user={user_id}")
 
 # ------------------ Auto Album System ------------------
 async def auto_send_album(user_id, chat_id):
@@ -424,10 +412,6 @@ async def auto_send_album(user_id, chat_id):
     if len(medias) == 1:
         await send_single_silent(user_id, chat_id, medias[0])
         return
-
-    # Forward all to storage first
-    for m in medias:
-        await forward_to_storage(m)
 
     # Track outcomes per message
     sent_ids = []      # originals to delete
@@ -498,8 +482,6 @@ async def auto_send_album(user_id, chat_id):
 
 async def send_single_silent(user_id, chat_id, media):
     log.info(f"=== SINGLE SEND: user={user_id}, media={media.media} ===")
-
-    await forward_to_storage(media)
 
     sent = False
     try:
@@ -592,32 +574,19 @@ async def cleanup(user_id, chat_id):
     log.info(f"CLEANUP_DONE | user={user_id} deleted={deleted} failed={failed}")
 
 # ------------------ Bot Start ------------------
+async def on_startup(client):
+    global tg_log_handler
+    if tg_log_handler and not tg_log_handler._task:
+        tg_log_handler.start()
+        log.info("Telegram log handler started")
+    log.warning(f"BOT_ONLINE | max_album={Config.MAX_ALBUM_SIZE} storage={Config.STORAGE_GROUP_ID or 'none'} log_channel={Config.LOG_CHANNEL_ID or 'none'}")
+    asyncio.create_task(cleanup_stale_sessions())
+    log.info("Background cleanup task started")
+
+bot.on_message(filters.private & filters.command("start"))(start)
+
 if __name__ == "__main__":
-    log.info("Starting Anonymous Forward Bot...")
-    log.info(f"Max album size: {Config.MAX_ALBUM_SIZE}")
-    
-    # Start background cleanup task
-    bot.loop.create_task(cleanup_stale_sessions())
-    log.info("Background cleanup task started (runs every 10 minutes)")
-    
-    # Graceful shutdown handler
-    async def shutdown_handler():
-        log.info("Shutdown signal received — flushing pending media...")
-        tasks = []
-        for user_id, medias in list(media_groups.items()):
-            if medias:
-                chat_id = medias[0].chat.id
-                log.info(f"Flushing {len(medias)} items for user {user_id}")
-                tasks.append(auto_send_album(user_id, chat_id))
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        log.info("Flush complete. Shutting down.")
-
-    def handle_signal(sig, frame):
-        loop = asyncio.get_event_loop()
-        loop.create_task(shutdown_handler())
-
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
-    
-    bot.run()
+    bot.start()
+    asyncio.get_event_loop().run_until_complete(on_startup(bot))
+    log.info("Bot is running")
+    bot.idle()
