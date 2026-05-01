@@ -401,10 +401,9 @@ async def auto_send_album(user_id, chat_id):
 
     # Notify about any flagged files
     if invalid_ids or failed_count:
-        total_flagged = len(set(invalid_ids))
         await bot.send_message(
             chat_id,
-            f"⚠️ {total_flagged} file(s) could not be processed — Telegram has flagged or restricted them. "
+            f"⚠️ Some files could not be processed — Telegram has flagged or restricted them. "
             f"Please don't resend them."
         )
 
@@ -509,13 +508,13 @@ async def send_album(chat_id, medias):
         if failed:
             await bot.send_message(
                 chat_id,
-                f"⚠️ {failed} file(s) could not be processed and were skipped. "
-                f"This can happen if Telegram has flagged or restricted the file."
+                "⚠️ Some files could not be processed and were skipped. "
+                "This can happen if Telegram has flagged or restricted the file."
             )
         return sent > 0
     
     if skipped:
-        await bot.send_message(chat_id, f"⚠️ {skipped} file(s) could not be processed and were skipped.")
+        await bot.send_message(chat_id, "⚠️ Some files could not be processed and were skipped.")
     
     return True
 
