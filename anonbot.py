@@ -589,4 +589,4 @@ if __name__ == "__main__":
     bot.start()
     asyncio.get_event_loop().run_until_complete(on_startup(bot))
     log.info("Bot is running")
-    bot.idle()
+    asyncio.Event().wait()
