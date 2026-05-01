@@ -309,214 +309,133 @@ async def handle_media(client, message):
 
 # ------------------ Auto Album System ------------------
 async def auto_send_album(user_id, chat_id):
-    logging.info(f"=== AUTO_SEND_ALBUM: user={user_id}, chat={chat_id} ===")
-    medias = media_groups[user_id]
+    logging.info(f"=== AUTO_SEND_ALBUM: user={user_id} count={len(media_groups[user_id])} ===")
+    medias = list(media_groups[user_id])
 
     if not medias:
-        logging.warning(f"User {user_id}: No medias in auto_send_album")
         return
 
-    count = len(medias)
-
-    if count == 1:
+    if len(medias) == 1:
         await send_single_silent(user_id, chat_id, medias[0])
-        media_groups[user_id].clear()
-        original_messages[user_id].clear()
         return
 
-    # Forward each to storage individually (invalid ones are skipped inside forward_to_storage)
+    # Forward all to storage first
     for m in medias:
         await forward_to_storage(m)
 
-    # Try to build the media list, testing each file_id individually first
-    valid_media = []
-    invalid_ids = []
+    # Track outcomes per message
+    sent_ids = []      # originals to delete
+    flagged_ids = []   # originals to leave in DM
 
+    # Build album list, pairing each InputMedia back to its source message
+    paired = []
     for m in medias:
-        try:
-            # Probe the file_id with a get_messages call to catch bad ids before building album
-            if m.photo:
-                valid_media.append((m, InputMediaPhoto(m.photo.file_id)))
-            elif m.video:
-                valid_media.append((m, InputMediaVideo(m.video.file_id)))
-            elif m.document:
-                valid_media.append((m, InputMediaDocument(m.document.file_id)))
-            elif m.audio:
-                logging.warning(f"Skipping audio in album")
-                invalid_ids.append(m.id)
-        except Exception as e:
-            logging.error(f"Error building media item: {e}")
-            invalid_ids.append(m.id)
+        if m.photo:
+            paired.append((m, InputMediaPhoto(m.photo.file_id)))
+        elif m.video:
+            paired.append((m, InputMediaVideo(m.video.file_id)))
+        elif m.document:
+            paired.append((m, InputMediaDocument(m.document.file_id)))
+        elif m.audio:
+            # Audio can't go in albums — send individually
+            ok = await send_single_by_media(chat_id, m)
+            (sent_ids if ok else flagged_ids).append(m.id)
+            await asyncio.sleep(0.2)
 
-    if not valid_media:
-        await bot.send_message(chat_id, "⚠️ None of the files could be processed. Telegram has flagged or restricted them. Please don't resend them.")
-        media_groups[user_id].clear()
-        original_messages[user_id].clear()
-        return
-
-    # Send in chunks, catching invalid file errors per-chunk then falling back per-item
+    # Send in chunks of 10
     CHUNK_SIZE = 10
-    all_items = valid_media
-    failed_count = 0
-    successfully_deleted = []
-
-    for i in range(0, len(all_items), CHUNK_SIZE):
-        chunk = all_items[i:i + CHUNK_SIZE]
+    for i in range(0, len(paired), CHUNK_SIZE):
+        chunk = paired[i:i + CHUNK_SIZE]
         chunk_msgs = [item[0] for item in chunk]
         chunk_media = [item[1] for item in chunk]
 
         try:
             result = await safe_send(bot.send_media_group, chat_id, media=chunk_media)
             if result:
-                successfully_deleted.extend([m.id for m in chunk_msgs])
+                sent_ids.extend(m.id for m in chunk_msgs)
             else:
-                logging.error(f"Chunk {i} returned None")
-                failed_count += len(chunk)
+                # send_media_group returned None (non-flood RPC error) — try one by one
+                for m, _ in chunk:
+                    ok = await send_single_by_media(chat_id, m)
+                    (sent_ids if ok else flagged_ids).append(m.id)
+                    await asyncio.sleep(0.2)
         except InvalidFileError:
-            # One bad file in this chunk — fall back to sending one by one
-            logging.warning(f"Invalid file in chunk {i}, falling back to per-item send")
+            # One bad file poisoned the chunk — fall back to per-item
+            logging.warning(f"Invalid file in chunk {i//CHUNK_SIZE + 1}, retrying per-item")
             for m, _ in chunk:
-                try:
-                    await send_single_by_media(chat_id, m)
-                    successfully_deleted.append(m.id)
-                except InvalidFileError:
-                    logging.warning(f"Skipping invalid file msg {m.id}")
-                    invalid_ids.append(m.id)
-                    # Leave this original in chat
-                    if m.id in original_messages[user_id]:
-                        original_messages[user_id].remove(m.id)
-                    failed_count += 1
+                ok = await send_single_by_media(chat_id, m)
+                (sent_ids if ok else flagged_ids).append(m.id)
                 await asyncio.sleep(0.2)
 
-        if i + CHUNK_SIZE < len(all_items):
+        if i + CHUNK_SIZE < len(paired):
             await asyncio.sleep(0.5)
 
-    # Delete only successfully sent originals
-    for msg_id in successfully_deleted:
+    # Delete only what was successfully sent
+    for msg_id in sent_ids:
         try:
             await bot.delete_messages(chat_id, msg_id)
             await asyncio.sleep(0.05)
         except Exception as e:
             logging.warning(f"Could not delete msg {msg_id}: {e}")
 
-    # Notify about any flagged files
-    if invalid_ids or failed_count:
+    # One consolidated warning if anything was flagged
+    if flagged_ids:
         await bot.send_message(
             chat_id,
-            f"⚠️ Some files could not be processed — Telegram has flagged or restricted them. "
-            f"Please don't resend them."
+            f"⚠️ {len(flagged_ids)} file(s) could not be processed — Telegram has flagged or restricted them. "
+            f"Alternatively upload media from your device to give it a new file id."
         )
 
     media_groups[user_id].clear()
     original_messages[user_id].clear()
-
-    logging.info(f"=== AUTO_SEND_ALBUM END user={user_id} ===")
+    logging.info(f"=== AUTO_SEND_ALBUM END: sent={len(sent_ids)} flagged={len(flagged_ids)} ===")
 
 async def send_single_silent(user_id, chat_id, media):
     logging.info(f"=== SINGLE SEND: user={user_id}, media={media.media} ===")
 
     await forward_to_storage(media)
 
+    sent = False
     try:
         if media.photo:
-            result = await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
+            await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
         elif media.video:
-            result = await safe_send(bot.send_video, chat_id, video=media.video.file_id)
+            await safe_send(bot.send_video, chat_id, video=media.video.file_id)
         elif media.document:
-            result = await safe_send(bot.send_document, chat_id, document=media.document.file_id)
+            await safe_send(bot.send_document, chat_id, document=media.document.file_id)
         elif media.audio:
-            result = await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
-        else:
-            result = None
+            await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
+        sent = True
+    except InvalidFileError:
+        logging.warning(f"Invalid file_id msg {media.id} — leaving in DM")
+        await bot.send_message(chat_id, "⚠️ 1 file could not be processed — Telegram has flagged it. It has been left in your chat.")
+    except Exception as e:
+        logging.error(f"Unexpected error sending single: {e}")
 
-        if not result:
-            logging.error("Single send returned None")
-            await bot.send_message(chat_id, "⚠️ Failed to send media. Please try again.")
-            return
-
-        # Success — delete the original
+    if sent:
         try:
             await bot.delete_messages(chat_id, media.id)
         except Exception as e:
-            logging.warning(f"Could not delete original msg {media.id}: {e}")
+            logging.warning(f"Could not delete msg {media.id}: {e}")
 
-    except InvalidFileError:
-        # Only this file is bad — leave original in chat, notify user
-        logging.warning(f"Invalid file_id for msg {media.id} — leaving original, notifying user")
-        if media.id in original_messages[user_id]:
-            original_messages[user_id].remove(media.id)
-        await bot.send_message(
-            chat_id,
-            "⚠️ One file could not be processed — Telegram has flagged or restricted it. "
-            "Please don't resend it."
-        )
-
+    media_groups[user_id].clear()
+    original_messages[user_id].clear()
     logging.info(f"=== SINGLE SEND END ===")
 
 async def send_single_by_media(chat_id, media):
-    """Helper to send one media item — raises InvalidFileError if bad file_id."""
-    if media.photo:
-        await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
-    elif media.video:
-        await safe_send(bot.send_video, chat_id, video=media.video.file_id)
-    elif media.document:
-        await safe_send(bot.send_document, chat_id, document=media.document.file_id)
-    elif media.audio:
-        await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
-
-async def send_album(chat_id, medias):
-    """Send multiple media as an album, skipping invalid file_ids."""
-    media_list = []
-    skipped = 0
-    
-    for m in medias:
-        try:
-            if m.photo:
-                media_list.append(InputMediaPhoto(m.photo.file_id))
-            elif m.video:
-                media_list.append(InputMediaVideo(m.video.file_id))
-            elif m.document:
-                media_list.append(InputMediaDocument(m.document.file_id))
-            elif m.audio:
-                logging.warning(f"⚠️ Skipping audio in album")
-                skipped += 1
-                continue
-        except Exception as e:
-            logging.error(f"❌ Error building album item: {e}")
-            skipped += 1
-    
-    if not media_list:
-        logging.error(f"❌ No valid media in album!")
-        await bot.send_message(chat_id, "⚠️ None of the files could be processed. They may be flagged or restricted by Telegram.")
-        return False
-    
+    """Send one item. Returns True on success, False on invalid file. Raises on other errors."""
     try:
-        await safe_send(bot.send_media_group, chat_id, media=media_list)
+        if media.photo:
+            await safe_send(bot.send_photo, chat_id, photo=media.photo.file_id)
+        elif media.video:
+            await safe_send(bot.send_video, chat_id, video=media.video.file_id)
+        elif media.document:
+            await safe_send(bot.send_document, chat_id, document=media.document.file_id)
+        elif media.audio:
+            await safe_send(bot.send_audio, chat_id, audio=media.audio.file_id)
+        return True
     except InvalidFileError:
-        logging.warning("Album failed due to invalid file_id — trying items one by one")
-        sent = 0
-        failed = 0
-        for m in medias:
-            try:
-                await send_single_by_media(chat_id, m)
-                sent += 1
-            except InvalidFileError:
-                failed += 1
-                logging.warning(f"Skipping invalid file in album fallback: msg {m.id}")
-            await asyncio.sleep(0.3)
-        
-        if failed:
-            await bot.send_message(
-                chat_id,
-                "⚠️ Some files could not be processed and were skipped. "
-                "This can happen if Telegram has flagged or restricted the file."
-            )
-        return sent > 0
-    
-    if skipped:
-        await bot.send_message(chat_id, "⚠️ Some files could not be processed and were skipped.")
-    
-    return True
+        return False
 
 # ------------------ Storage & Cleanup ------------------
 async def forward_to_storage(message):
