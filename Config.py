@@ -11,6 +11,7 @@ class Config:
 
     STORAGE_GROUP_ID = int(os.getenv("STORAGE_GROUP_ID", "0")) or None
     OWNER_ID = int(os.getenv("OWNER_ID", "0")) or None
+    LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0")) or None
 
     MAX_ALBUM_SIZE = 10
 
