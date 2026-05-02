@@ -58,6 +58,92 @@ bot = Client(
     bot_token=Config.BOT_TOKEN,
 )
 
+# ── Telegram log channel handler ────────────────────────────
+
+class TelegramLogHandler(logging.Handler):
+    """
+    Async handler that ships WARNING+ logs to a Telegram group/channel.
+    Uses an internal queue so it never blocks the event loop.
+    Errors inside the handler are swallowed — logging must never crash the bot.
+    """
+    ICONS = {
+        logging.DEBUG:    "🔍",
+        logging.INFO:     "ℹ️",
+        logging.WARNING:  "⚠️",
+        logging.ERROR:    "❌",
+        logging.CRITICAL: "🚨",
+    }
+
+    def __init__(self, bot_client, channel_id):
+        super().__init__(level=logging.WARNING)  # WARNING+ to Telegram only
+        self.bot_client  = bot_client
+        self.channel_id  = channel_id
+        self._queue: asyncio.Queue = None   # created after loop starts
+        self._task:  asyncio.Task  = None
+
+    def _ensure_queue(self):
+        if self._queue is None:
+            self._queue = asyncio.Queue(maxsize=200)
+
+    def start(self):
+        """Must be called once the asyncio event loop is running."""
+        self._ensure_queue()
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._worker())
+            log.info("TG_LOG_HANDLER | worker started")
+
+    def emit(self, record: logging.LogRecord):
+        self._ensure_queue()
+        try:
+            self._queue.put_nowait(record)
+        except asyncio.QueueFull:
+            pass  # Drop — never block the bot
+
+    async def _worker(self):
+        while True:
+            try:
+                record = await self._queue.get()
+                await self._ship(record)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass  # Swallow everything
+            finally:
+                try:
+                    self._queue.task_done()
+                except Exception:
+                    pass
+                await asyncio.sleep(0.4)  # ~2.5 msgs/sec max to log channel
+
+    async def _ship(self, record: logging.LogRecord):
+        try:
+            icon  = self.ICONS.get(record.levelno, "📋")
+            msg   = self.format(record)
+            # Escape HTML special chars in the log line
+            safe  = msg.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+            if record.exc_info:
+                tb   = "".join(traceback.format_exception(*record.exc_info))
+                # Truncate to stay under Telegram's 4096 char limit
+                tb   = tb[-1800:]
+                safe_tb = tb.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                text = f"{icon} <b>[{record.levelname}]</b>\n<code>{safe}</code>\n\n<pre>{safe_tb}</pre>"
+            else:
+                text = f"{icon} <b>[{record.levelname}]</b>\n<code>{safe}</code>"
+
+            # Hard cap at 4096
+            text = text[:4090]
+
+            await self.bot_client.send_message(
+                self.channel_id,
+                text,
+                parse_mode="html",
+                disable_notification=(record.levelno < logging.ERROR),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass  # Never propagate
+
 # Attach Telegram log handler if channel configured
 tg_log_handler: TelegramLogHandler | None = None
 if getattr(Config, "LOG_CHANNEL_ID", None):
